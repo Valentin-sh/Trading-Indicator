@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
-"""Journal de trading professionnel avec synchronisation Kraken Pro.
-
-Fonctionnalités:
-- Synchronisation automatique des trades Kraken Pro via API privée.
-- Stockage local SQLite pour historiser les données.
-- Reconstruction des performances (win rate, gain moyen, perte moyenne, expectancy, profit factor, drawdown).
-- Export CSV.
-"""
+"""Journal de trading professionnel avec synchronisation Kraken Futures."""
 
 from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import csv
 import hashlib
 import hmac
@@ -20,17 +14,16 @@ import os
 import sqlite3
 import sys
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
-
-import urllib.error
-import urllib.request
+from typing import Dict, Iterable, List, Optional, Tuple
 
 DB_DEFAULT = "trading_journal.db"
-API_URL = "https://api.kraken.com"
+KRAKEN_FUTURES_API_URL = "https://futures.kraken.com"
 
 
 @dataclass
@@ -59,6 +52,20 @@ class ClosedLot:
     close_time: float
 
 
+def _decode_futures_secret(secret: str) -> bytes:
+    """Décodage robuste des secrets Kraken Futures (base64 parfois sans padding)."""
+    secret = secret.strip()
+    missing_padding = (-len(secret)) % 4
+    if missing_padding:
+        secret = secret + ("=" * missing_padding)
+    try:
+        return base64.b64decode(secret)
+    except binascii.Error as exc:
+        raise RuntimeError(
+            "Impossible de décoder KRAKEN_FUTURES_API_SECRET (format base64 invalide)."
+        ) from exc
+
+
 def connect_db(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
@@ -79,104 +86,173 @@ def init_db(conn: sqlite3.Connection) -> None:
             fee REAL NOT NULL,
             volume REAL NOT NULL,
             timestamp REAL NOT NULL,
-            imported_at TEXT NOT NULL
+            imported_at TEXT NOT NULL,
+            source TEXT,
+            fill_time_iso TEXT,
+            raw_payload TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_raw_trades_time ON raw_trades(timestamp);
         CREATE INDEX IF NOT EXISTS idx_raw_trades_pair ON raw_trades(pair);
         """
     )
+
+    # Migration douce si la base existait déjà (ancienne version spot).
+    existing_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(raw_trades)").fetchall()
+    }
+    for col_name, col_type in [
+        ("source", "TEXT"),
+        ("fill_time_iso", "TEXT"),
+        ("raw_payload", "TEXT"),
+    ]:
+        if col_name not in existing_cols:
+            conn.execute(f"ALTER TABLE raw_trades ADD COLUMN {col_name} {col_type}")
+
     conn.commit()
 
 
-def kraken_signature(url_path: str, data: Dict[str, str], api_secret: str) -> str:
-    postdata = urllib.parse.urlencode(data)
-    encoded = (str(data["nonce"]) + postdata).encode()
-    message = url_path.encode() + hashlib.sha256(encoded).digest()
-    mac = hmac.new(base64.b64decode(api_secret), message, hashlib.sha512)
-    return base64.b64encode(mac.digest()).decode()
+def parse_iso_to_ts(iso_value: Optional[str]) -> Optional[float]:
+    if not iso_value:
+        return None
+    normalized = iso_value.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(normalized).timestamp()
+    except ValueError:
+        return None
 
 
-def kraken_private_request(endpoint: str, api_key: str, api_secret: str, payload: Dict[str, str]) -> Dict:
-    url_path = f"/0/private/{endpoint}"
-    url = f"{API_URL}{url_path}"
+def format_ts_to_iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
-    payload = dict(payload)
-    payload["nonce"] = str(int(time.time() * 1000))
+
+def futures_authent(endpoint_path: str, nonce: str, params_encoded: str, api_secret: str) -> str:
+    """Authent Kraken Futures v3:
+    1) sha256(postData + nonce + endpointPath)
+    2) hmac_sha512(secret_base64_decoded, step1)
+    3) base64(step2)
+    """
+    payload = f"{params_encoded}{nonce}{endpoint_path}".encode("utf-8")
+    hash_digest = hashlib.sha256(payload).digest()
+    secret_bytes = _decode_futures_secret(api_secret)
+    signature = hmac.new(secret_bytes, hash_digest, hashlib.sha512).digest()
+    return base64.b64encode(signature).decode("utf-8")
+
+
+def futures_private_request(
+    endpoint_path: str,
+    api_key: str,
+    api_secret: str,
+    params: Optional[Dict[str, str]] = None,
+    method: str = "GET",
+) -> Dict:
+    params = params or {}
+    params_encoded = urllib.parse.urlencode(params)
+    nonce = str(int(time.time() * 1000))
+    authent = futures_authent(endpoint_path, nonce, params_encoded, api_secret)
 
     headers = {
-        "API-Key": api_key,
-        "API-Sign": kraken_signature(url_path, payload, api_secret),
+        "APIKey": api_key,
+        "Authent": authent,
+        "Nonce": nonce,
+        "Accept": "application/json",
     }
 
-    data_encoded = urllib.parse.urlencode(payload).encode("utf-8")
-    request = urllib.request.Request(url, data=data_encoded, headers=headers, method="POST")
+    method = method.upper()
+    if method == "GET":
+        query = f"?{params_encoded}" if params_encoded else ""
+        url = f"{KRAKEN_FUTURES_API_URL}{endpoint_path}{query}"
+        req_data = None
+    else:
+        url = f"{KRAKEN_FUTURES_API_URL}{endpoint_path}"
+        req_data = params_encoded.encode("utf-8")
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
 
+    request = urllib.request.Request(url, data=req_data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             raw = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"HTTP error Kraken: {exc.code} {detail}") from exc
+        raise RuntimeError(f"HTTP error Kraken Futures: {exc.code} {detail}") from exc
 
     data = json.loads(raw)
-    if data.get("error"):
-        raise RuntimeError(f"Kraken API error: {data['error']}")
+    if data.get("result") == "error":
+        raise RuntimeError(f"Kraken Futures API error: {data}")
 
-    return data["result"]
-
-
-def fetch_all_trades(api_key: str, api_secret: str, start_ts: float | None = None) -> List[Trade]:
-    all_trades: List[Trade] = []
-    ofs = 0
-
-    while True:
-        payload: Dict[str, str] = {"ofs": str(ofs), "type": "all", "trades": "true"}
-        if start_ts is not None:
-            payload["start"] = str(int(start_ts))
-
-        result = kraken_private_request("TradesHistory", api_key, api_secret, payload)
-        trades_block = result.get("trades", {})
-        count = int(result.get("count", 0))
-
-        for trade_id, t in trades_block.items():
-            all_trades.append(
-                Trade(
-                    trade_id=trade_id,
-                    ordertxid=t.get("ordertxid", ""),
-                    pair=t["pair"],
-                    side=t["type"],
-                    ordertype=t.get("ordertype", ""),
-                    price=float(t["price"]),
-                    cost=float(t["cost"]),
-                    fee=float(t["fee"]),
-                    volume=float(t["vol"]),
-                    timestamp=float(t["time"]),
-                )
-            )
-
-        ofs += len(trades_block)
-        if ofs >= count or not trades_block:
-            break
-
-        time.sleep(1)
-
-    return all_trades
+    return data
 
 
-def save_trades(conn: sqlite3.Connection, trades: Iterable[Trade]) -> Tuple[int, int]:
+def fill_to_trade(fill: Dict) -> Trade:
+    # Schéma courant Kraken Futures fills: fill_id, order_id, symbol, side, size, price, fillTime, fillType, fee
+    trade_id = str(fill.get("fill_id") or fill.get("fillId") or fill.get("uid") or "")
+    if not trade_id:
+        fallback = f"{fill.get('order_id','na')}:{fill.get('fillTime','na')}:{fill.get('price','na')}"
+        trade_id = fallback
+
+    order_id = str(fill.get("order_id") or fill.get("orderId") or "")
+    pair = str(fill.get("symbol") or fill.get("instrument") or "UNKNOWN")
+    side = str(fill.get("side") or ("buy" if fill.get("buy") else "sell")).lower()
+    ordertype = str(fill.get("fillType") or fill.get("fill_type") or "")
+
+    price = float(fill.get("price") or 0.0)
+    volume = float(fill.get("size") or fill.get("qty") or 0.0)
+    fee = float(fill.get("fee") or 0.0)
+    cost = price * volume
+
+    ts = parse_iso_to_ts(fill.get("fillTime"))
+    if ts is None:
+        ts = float(fill.get("time") or fill.get("timestamp") or time.time())
+
+    return Trade(
+        trade_id=trade_id,
+        ordertxid=order_id,
+        pair=pair,
+        side=side,
+        ordertype=ordertype,
+        price=price,
+        cost=cost,
+        fee=fee,
+        volume=volume,
+        timestamp=ts,
+    )
+
+
+def fetch_futures_fills(api_key: str, api_secret: str, last_fill_time: Optional[str]) -> List[Tuple[Trade, Dict]]:
+    params: Dict[str, str] = {}
+    if last_fill_time:
+        params["lastFillTime"] = last_fill_time
+
+    data = futures_private_request(
+        endpoint_path="/derivatives/api/v3/fills",
+        api_key=api_key,
+        api_secret=api_secret,
+        params=params,
+        method="GET",
+    )
+
+    fills = data.get("fills", []) or []
+    parsed: List[Tuple[Trade, Dict]] = []
+    for fill in fills:
+        parsed.append((fill_to_trade(fill), fill))
+
+    return parsed
+
+
+def save_trades(conn: sqlite3.Connection, trades: Iterable[Tuple[Trade, Dict]]) -> Tuple[int, int]:
     inserted = 0
     skipped = 0
     now = datetime.now(timezone.utc).isoformat()
 
     sql = """
         INSERT OR IGNORE INTO raw_trades
-        (trade_id, ordertxid, pair, side, ordertype, price, cost, fee, volume, timestamp, imported_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (trade_id, ordertxid, pair, side, ordertype, price, cost, fee, volume, timestamp, imported_at, source, fill_time_iso, raw_payload)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 
     cur = conn.cursor()
-    for trade in trades:
+    for trade, raw in trades:
+        fill_time_iso = raw.get("fillTime")
         cur.execute(
             sql,
             (
@@ -191,6 +267,9 @@ def save_trades(conn: sqlite3.Connection, trades: Iterable[Trade]) -> Tuple[int,
                 trade.volume,
                 trade.timestamp,
                 now,
+                "kraken_futures",
+                fill_time_iso,
+                json.dumps(raw, ensure_ascii=False),
             ),
         )
         if cur.rowcount == 1:
@@ -202,10 +281,24 @@ def save_trades(conn: sqlite3.Connection, trades: Iterable[Trade]) -> Tuple[int,
     return inserted, skipped
 
 
-def get_last_timestamp(conn: sqlite3.Connection) -> float | None:
-    row = conn.execute("SELECT MAX(timestamp) AS max_ts FROM raw_trades").fetchone()
-    if row and row["max_ts"] is not None:
-        return float(row["max_ts"])
+def get_last_fill_time(conn: sqlite3.Connection) -> Optional[str]:
+    row = conn.execute(
+        """
+        SELECT fill_time_iso
+        FROM raw_trades
+        WHERE source = 'kraken_futures' AND fill_time_iso IS NOT NULL
+        ORDER BY timestamp DESC
+        LIMIT 1
+        """
+    ).fetchone()
+
+    if row and row["fill_time_iso"]:
+        return str(row["fill_time_iso"])
+
+    # fallback pour les bases plus anciennes sans fill_time_iso
+    row2 = conn.execute("SELECT MAX(timestamp) AS max_ts FROM raw_trades").fetchone()
+    if row2 and row2["max_ts"] is not None:
+        return format_ts_to_iso(float(row2["max_ts"]))
     return None
 
 
@@ -239,18 +332,14 @@ def reconstruct_closed_lots(trades: List[Trade]) -> List[ClosedLot]:
     closed: List[ClosedLot] = []
 
     for tr in trades:
-        pair_state = positions.setdefault(
-            tr.pair,
-            {"qty": 0.0, "avg": 0.0, "open_time": tr.timestamp},
-        )
-
+        pair_state = positions.setdefault(tr.pair, {"qty": 0.0, "avg": 0.0, "open_time": tr.timestamp})
         qty = pair_state["qty"]
         avg = pair_state["avg"]
 
         fee_per_unit = (tr.fee / tr.volume) if tr.volume else 0.0
 
         if tr.side == "buy":
-            if qty < 0:
+            if qty < 0:  # close short
                 close_qty = min(tr.volume, abs(qty))
                 pnl = (avg - tr.price) * close_qty - (fee_per_unit * close_qty)
                 closed.append(
@@ -273,16 +362,15 @@ def reconstruct_closed_lots(trades: List[Trade]) -> List[ClosedLot]:
                     pair_state["open_time"] = tr.timestamp
                 elif qty == 0:
                     avg = 0.0
-            else:
+            else:  # open/add long
                 new_qty = qty + tr.volume
-                if new_qty > 0:
-                    avg = ((qty * avg) + (tr.volume * tr.price)) / new_qty
+                avg = ((qty * avg) + (tr.volume * tr.price)) / new_qty if new_qty > 0 else 0.0
                 qty = new_qty
                 if qty == tr.volume:
                     pair_state["open_time"] = tr.timestamp
 
         elif tr.side == "sell":
-            if qty > 0:
+            if qty > 0:  # close long
                 close_qty = min(tr.volume, qty)
                 pnl = (tr.price - avg) * close_qty - (fee_per_unit * close_qty)
                 closed.append(
@@ -305,12 +393,11 @@ def reconstruct_closed_lots(trades: List[Trade]) -> List[ClosedLot]:
                     pair_state["open_time"] = tr.timestamp
                 elif qty == 0:
                     avg = 0.0
-            else:
+            else:  # open/add short
                 new_qty = qty - tr.volume
                 short_qty_before = abs(qty)
                 short_qty_after = abs(new_qty)
-                if short_qty_after > 0:
-                    avg = ((short_qty_before * avg) + (tr.volume * tr.price)) / short_qty_after
+                avg = ((short_qty_before * avg) + (tr.volume * tr.price)) / short_qty_after if short_qty_after > 0 else 0.0
                 qty = new_qty
                 if qty == -tr.volume:
                     pair_state["open_time"] = tr.timestamp
@@ -347,8 +434,7 @@ def compute_stats(closed_lots: List[ClosedLot]) -> Dict[str, float]:
     for c in closed_lots:
         equity += c.pnl
         peak = max(peak, equity)
-        dd = peak - equity
-        max_dd = max(max_dd, dd)
+        max_dd = max(max_dd, peak - equity)
 
     return {
         "nb_trades_fermes": len(closed_lots),
@@ -369,21 +455,37 @@ def cmd_init(args: argparse.Namespace) -> None:
 
 
 def cmd_sync(args: argparse.Namespace) -> None:
-    api_key = os.getenv("KRAKEN_API_KEY")
-    api_secret = os.getenv("KRAKEN_API_SECRET")
+    api_key = os.getenv("KRAKEN_FUTURES_API_KEY") or os.getenv("KRAKEN_API_KEY")
+    api_secret = os.getenv("KRAKEN_FUTURES_API_SECRET") or os.getenv("KRAKEN_API_SECRET")
 
     if not api_key or not api_secret:
-        print("Erreur: définir KRAKEN_API_KEY et KRAKEN_API_SECRET", file=sys.stderr)
+        print(
+            "Erreur: définir KRAKEN_FUTURES_API_KEY et KRAKEN_FUTURES_API_SECRET "
+            "(ou variables legacy KRAKEN_API_KEY/KRAKEN_API_SECRET)",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     conn = connect_db(args.db)
     init_db(conn)
 
-    start_ts = None if args.full else get_last_timestamp(conn)
-    trades = fetch_all_trades(api_key, api_secret, start_ts=start_ts)
-    inserted, skipped = save_trades(conn, trades)
+    last_fill_time = None if args.full else get_last_fill_time(conn)
+    fills = fetch_futures_fills(api_key, api_secret, last_fill_time=last_fill_time)
+    inserted, skipped = save_trades(conn, fills)
 
-    print(json.dumps({"recuperes": len(trades), "inseres": inserted, "deja_presents": skipped}, indent=2))
+    print(
+        json.dumps(
+            {
+                "source": "kraken_futures",
+                "lastFillTime_utilise": last_fill_time,
+                "recuperes": len(fills),
+                "inseres": inserted,
+                "deja_presents": skipped,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
 
 
 def cmd_report(args: argparse.Namespace) -> None:
@@ -398,7 +500,7 @@ def cmd_report(args: argparse.Namespace) -> None:
     print(f"Win rate: {stats['win_rate']:.2f}%")
     print(f"Gain moyen (wins): {stats['avg_win']:.4f}")
     print(f"Perte moyenne (losses): {stats['avg_loss']:.4f}")
-    pf = stats['profit_factor']
+    pf = stats["profit_factor"]
     pf_str = "∞" if pf == float("inf") else f"{pf:.4f}"
     print(f"Profit factor: {pf_str}")
     print(f"Expectancy par trade: {stats['expectancy']:.4f}")
@@ -444,7 +546,7 @@ def cmd_export(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Journal de trading professionnel connecté à Kraken Pro")
+    parser = argparse.ArgumentParser(description="Journal de trading professionnel connecté à Kraken Futures")
     parser.add_argument("--db", default=DB_DEFAULT, help=f"Chemin SQLite (défaut: {DB_DEFAULT})")
 
     sub = parser.add_subparsers(dest="command", required=True)
@@ -452,8 +554,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_init = sub.add_parser("init-db", help="Initialiser la base locale")
     p_init.set_defaults(func=cmd_init)
 
-    p_sync = sub.add_parser("sync-kraken", help="Synchroniser les trades Kraken Pro")
-    p_sync.add_argument("--full", action="store_true", help="Recharger l'historique complet")
+    p_sync = sub.add_parser("sync-kraken", help="Synchroniser les fills Kraken Futures")
+    p_sync.add_argument("--full", action="store_true", help="Recharger l'historique complet (sans filtre lastFillTime)")
     p_sync.set_defaults(func=cmd_sync)
 
     p_report = sub.add_parser("report", help="Afficher les métriques pro")

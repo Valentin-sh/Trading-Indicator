@@ -1,6 +1,8 @@
-# Trading Journal Pro (Kraken Pro)
+# Trading Journal Pro (Kraken Futures)
 
-Ce dépôt contient un **journal de trading professionnel** qui collecte automatiquement tes trades depuis **Kraken Pro** pour calculer des stats avancées:
+Ce dépôt contient un **journal de trading professionnel** qui collecte automatiquement tes exécutions depuis **Kraken Futures (dérivés)** pour calculer des stats avancées.
+
+## Métriques calculées
 
 - Taux de réussite (win rate)
 - Gain moyen des trades gagnants
@@ -18,11 +20,18 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## 2) Configuration Kraken
+> Le script principal fonctionne sans dépendance externe (stdlib Python), mais conserver `pip install -r requirements.txt` est sans danger.
 
-1. Crée une clé API Kraken Pro avec accès aux données de trading privées (`Query Closed Orders & Trades`).
-2. Copie `.env.example` vers ton fichier d'environnement.
-3. Exporte les variables:
+## 2) Configuration Kraken Futures
+
+Crée une clé API **Kraken Futures** (permissions `General API - Read Only` minimum pour lire les fills) et exporte les variables:
+
+```bash
+export KRAKEN_FUTURES_API_KEY="..."
+export KRAKEN_FUTURES_API_SECRET="..."
+```
+
+Compatibilité legacy conservée:
 
 ```bash
 export KRAKEN_API_KEY="..."
@@ -37,9 +46,9 @@ export KRAKEN_API_SECRET="..."
 python journal_trading.py init-db
 ```
 
-### Synchroniser les trades depuis Kraken
+### Synchroniser les trades futures depuis Kraken
 
-Incremental (recommandé):
+Incremental (recommandé, via `lastFillTime`):
 
 ```bash
 python journal_trading.py sync-kraken
@@ -63,23 +72,27 @@ python journal_trading.py report
 python journal_trading.py export-csv --output closed_trades.csv
 ```
 
-## 4) Structure des données
+## 4) Détails techniques importants
 
-- `raw_trades`: stockage brut des exécutions Kraken (id, pair, side, price, cost, fee, volume, timestamp).
-- `closed_lots` (reconstruit à la volée): rapprochement entrée/sortie pour estimer les trades réellement fermés et calculer les métriques.
+- API utilisée: `https://futures.kraken.com/derivatives/api/v3/fills`
+- Authentification utilisée: headers `APIKey`, `Authent`, `Nonce` (format Kraken Futures v3)
+- Formule de signature implémentée:
+  1. `sha256(postData + nonce + endpointPath)`
+  2. `hmac_sha512(secret_base64_decode, sha256_digest)`
+  3. `base64(hmac_digest)`
+- Décodage du secret robuste (padding base64 auto) pour éviter l'erreur `Incorrect padding`.
 
-## 5) Notes importantes
+## 5) Structure des données SQLite
 
-- Le script reconstruit les positions fermées à partir des exécutions (`TradesHistory`) avec logique long/short.
-- Les résultats dépendent de la qualité des données retournées par Kraken et de ta façon de trader (spot, margin, scaling in/out, etc.).
-- Pour un tracking institutionnel encore plus poussé, tu peux brancher ensuite:
-  - tags de setup (breakout, pullback, mean reversion)
-  - contexte marché (volatilité, session, news)
-  - screenshots d'entrées/sorties
-  - métriques par stratégie et par actif
+Table `raw_trades`:
+
+- Colonnes de base: `trade_id`, `ordertxid`, `pair`, `side`, `ordertype`, `price`, `cost`, `fee`, `volume`, `timestamp`
+- Colonnes source futures: `source`, `fill_time_iso`, `raw_payload`
+
+La migration de schéma est automatique si tu avais déjà la version précédente.
 
 ## 6) Fichiers
 
-- `journal_trading.py`: moteur principal (sync + analytics + export)
-- `requirements.txt`: dépendances Python
-- `.env.example`: variables d'environnement Kraken
+- `journal_trading.py`: moteur principal (sync futures + analytics + export)
+- `requirements.txt`: dépendances (aucune obligatoire)
+- `.env.example`: variables d'environnement futures
